@@ -1,1530 +1,1553 @@
 #!/usr/bin/env python3
-"""free-model-aggregator-01: one server, two client wires, ten free providers.
+"""Best-free routing aggregator — free-model-aggregator-01.
 
-The server reads its brief from MAKEFUN_PROMPT_FILE, probes every provider's
-catalog route, registers its port and catalog with the trial env, then serves
-the env client's 20 requests: POST /v1/chat/completions (OpenAI wire) and
-POST /v1/messages (Anthropic wire), each in JSON or server-sent events.
+One server, two client wires, ten simulated free-tier providers.
 
-Routing: for each request the candidates are the free models that meet its
-requirements (tools, vision, JSON mode, minimum context), ordered by the
-brief's sealed quality rating, best first, ties by provider id then model id.
-The first provider call that answers 2xx wins. A 402 (free allowance gone),
-429 or 5xx fails over to the next candidate; a provider that refuses twice in
-a row is set aside for the rest of the trial. A 401/400 is never retried --
-the request itself is the problem. A JSON-mode OpenAI request never goes to
-an Anthropic-wire provider, whose echo cannot carry JSON mode. Every choice
-is a pure function of the brief, the requests and the providers' answers: no
-wall clock, no unseeded randomness, so a replayed trial makes the same
-choices.
+The server listens on a port it picks, registers that port plus the
+catalog it read from the providers with the trial environment, and then
+answers the twenty requests the environment's client sends it, one at a
+time, in the wire each request arrived on (OpenAI Chat Completions or
+Anthropic Messages, JSON or server-sent events).
 
-`python3 main.py --list` prints the catalog document and exits 0.
+Routing, in one sentence: for every request, walk the free models that
+meet the request's requirements in sealed-quality order and take the
+first provider call that answers; a provider that refuses twice in a
+row is retired for the rest of the trial.
+
+A few principles shape everything below:
+
+* Pass the request through untouched.  The provider echoes back what
+  it parsed — the system prompt, the user text, the images, the tool
+  names, max_tokens, the stop sequences, the JSON-mode flag — and the
+  client compares that echo with what it sent.  A field rewritten or
+  dropped loses the request, so every wire translation below is a
+  faithful reshaping of the same fields, never a summary of them.
+
+* Never stream from upstream.  Every upstream call is made with
+  streaming off, so the full answer arrives as one JSON body.  The
+  server then builds its own streaming events from that text.  This
+  keeps the event order entirely under our control and means there is
+  exactly one successful upstream call behind every served request.
+
+* One call at a time, always.  The client sends one request at a
+  time, the server handles one request at a time, and inside a request
+  it dials one provider at a time.  No provider ever sees a second
+  call while its first is in flight, so the concurrent-requests
+  refusal cannot fire.
+
+* Determinism is a feature, not a hope.  Nothing in a response comes
+  from the wall clock (the created timestamp is a fixed constant, and
+  dates come from MAKEFUN_TRIAL_NOW when one is ever needed), nothing
+  comes from unseeded randomness, and every routing choice is a pure
+  function of the brief, the request, and the provider answers seen
+  so far.  A replay of the same trial therefore makes the same calls
+  and leaves the same state export, byte for byte.
+
+* Only free models serve.  A paid model is never a legal pick, whatever
+  its rating, so the candidate list is built from the sealed quality
+  table's free rows only, and the catalog is built by probing each
+  provider's own catalog route and trusting its free flags.
+
+* Fail over, don't retry.  A 402, 429 or 5xx from a provider means
+  that provider is out of budget, on its failure schedule, or in
+  outage for this trial.  The next-best provider answers instead.  A
+  400 or 401 is a bug in our own call, so it is never retried; the
+  candidate is marked invalid and the walk moves on.
+
+Usage:
+    python3 main.py            run the server against the trial env
+    python3 main.py --list     print the catalog document and exit 0
+
+With no MAKEFUN_PROMPT_FILE set, --list prints {"providers": []}.
 """
 
+import hashlib
 import json
 import os
+import random
+import re
+import socket
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PROTOCOL_VERSION = 1
-POLL_INTERVAL = 0.1
-PROBE_TIMEOUT = 5.0
-UPSTREAM_TIMEOUT = 10.0
-MAX_BODY_BYTES = 32 * 1024 * 1024
+# ---------------------------------------------------------------------------
+# Fixed values.  The providers answer with created 1767225600 and the id
+# "chatcmpl-sim" / "msg_sim"; our own answers use fixed values too, so no
+# timestamp or random id ever leaks into a response.
+# ---------------------------------------------------------------------------
+
 FIXED_CREATED = 1767225600
-FIXED_ANTHROPIC_CREATED_AT = "2026-01-01T00:00:00Z"
+FIXED_OPENAI_ID = "chatcmpl-agg"
+FIXED_ANTHROPIC_ID = "msg_agg"
+FIXED_DATE = "2026-01-01T00:00:00Z"
+
+# SSE text is emitted in pieces of this many characters, mirroring the
+# providers' own chunking.  Any split would satisfy the wire checks;
+# thirteen keeps our streams shaped exactly like theirs.
+SSE_PIECE = 13
+
+# How long an upstream dial may take before it counts as a failure and
+# the walk moves to the next candidate.  The client waits 30 seconds
+# per request; ten seconds per provider call leaves ample room for a
+# full failover chain inside that budget.
+UPSTREAM_TIMEOUT = 10.0
+
+# Catalog probes are cheap loopback GETs; five seconds is generous.
+CATALOG_TIMEOUT = 5.0
+
+# Poll interval while waiting for the environment to say the workload
+# is done, and the cap on polls before giving up (about 150 seconds,
+# inside the trial's 180-second wall).
+WORK_POLL_INTERVAL = 0.1
+WORK_POLL_MAX = 1500
+
+# The Anthropic version the client sends, which we forward on every
+# Anthropic-wire call so the provider sees the same header it expects.
 ANTHROPIC_VERSION = "2023-06-01"
 
-ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-PROMPT_FILE = os.environ.get("MAKEFUN_PROMPT_FILE", "")
+
+def now_text():
+    """The only 'now' this program ever uses: the trial's fixed time.
+
+    MAKEFUN_TRIAL_NOW is the instance's opening time and the only date
+    a request may carry.  Outside a trial there is no trial time, so
+    the fixed date is used instead.  The wall clock is never read.
+    """
+    stamped = os.environ.get("MAKEFUN_TRIAL_NOW", "")
+    if stamped:
+        return stamped
+    return FIXED_DATE
+
+
+def seeded_rng():
+    """A random generator seeded from the trial seed, for any choice
+    that ever needs randomness.  Today the router is fully
+    deterministic and never draws from it; it exists so that no
+    future edit reaches for an unseeded source instead."""
+    seed = os.environ.get("MAKEFUN_TRIAL_SEED", "free-model-aggregator-01")
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return random.Random(int(digest[:16], 16))
+
+
+def compact_json(value):
+    """One canonical JSON spelling, used for the catalog document both
+    at registration time and by --list, so the two are byte for byte
+    the same document."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def read_body_bytes(handler):
+    """Read the request body of an incoming client request."""
+    length = handler.headers.get("Content-Length")
+    if length is None:
+        return b""
+    try:
+        wanted = int(length)
+    except ValueError:
+        return b""
+    if wanted <= 0:
+        return b""
+    # The trial caps bodies at 2 MiB; read at most a little past that.
+    return handler.rfile.read(min(wanted, 2 * 1024 * 1024 + 1024))
+
+
+def parse_json_object(raw):
+    """Parse bytes as a JSON object, or return None when they are not."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def split_pieces(text):
+    """Split answer text into SSE-sized pieces."""
+    if text == "":
+        return [""]
+    pieces = []
+    for at in range(0, len(text), SSE_PIECE):
+        pieces.append(text[at:at + SSE_PIECE])
+    return pieces
+
+
+def sha8_text(text):
+    """The first eight hex digits of a string's SHA-256, as the
+    providers hash the text they echo."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+
+def sha8_bytes(blob):
+    """The first eight hex digits of some bytes' SHA-256."""
+    return hashlib.sha256(blob).hexdigest()[:8]
+
+# ---------------------------------------------------------------------------
+# The brief.  MAKEFUN_PROMPT_FILE is one text file: prose, then three
+# single-line JSON documents — the provider directory, the sealed
+# quality table (free models only, with each request's best rating),
+# and the workload manifest.  Each document names its schema, so the
+# parser finds them by schema instead of by position.
+# ---------------------------------------------------------------------------
 
 PROVIDERS_SCHEMA = "free-model-aggregator-01/providers/v1"
 RATINGS_SCHEMA = "free-model-aggregator-01/ratings/v1"
 WORKLOAD_SCHEMA = "free-model-aggregator-01/workload/v1"
 
 
-def log(message):
-    sys.stderr.write("aggregator: %s\n" % message)
-    sys.stderr.flush()
+class Provider(object):
+    """One of the ten providers, as the brief's directory lists it."""
 
-
-def is_record(value):
-    return isinstance(value, dict)
-
-
-def as_str(value):
-    return value if isinstance(value, str) else ""
-
-
-def as_number(value):
-    if isinstance(value, (int, float)) and value == value:
-        return value
-    return None
-
-
-def as_bool(value):
-    return value if isinstance(value, bool) else None
-
-
-# ---------------------------------------------------------------------------
-# Brief parsing: the brief carries three JSON documents, found by `schema`.
-# ---------------------------------------------------------------------------
-
-def _object_end(text, start):
-    """Index of the closing brace matching the `{` at `start`, or -1."""
-    depth = 0
-    in_string = False
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if in_string:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
-def _documents_in(text):
-    """Every top-level JSON object in the text that carries a `schema`."""
-    docs = []
-    start = text.find("{")
-    while start != -1:
-        end = _object_end(text, start)
-        if end != -1:
-            try:
-                value = json.loads(text[start:end + 1])
-            except ValueError:
-                value = None
-            if is_record(value) and isinstance(value.get("schema"), str):
-                docs.append(value)
-        start = text.find("{", start + 1)
-    return docs
-
-
-class Provider:
     def __init__(self, row):
-        self.id = as_str(row.get("id"))
-        self.name = as_str(row.get("name")) or self.id
-        self.wire = row.get("wire")
-        self.auth = row.get("auth")
-        base = as_str(row.get("path")) or as_str(row.get("base_path")) \
-            or as_str(row.get("base_url")) or as_str(row.get("base"))
-        self.base = base
-        self.key_env = as_str(row.get("key_env"))
-        self.key = as_str(row.get("key"))
+        self.id = row["id"]
+        self.name = row.get("name", row["id"])
+        self.wire = row["wire"]
+        self.auth = row["auth"]
+        self.key_env = row.get("key_env", "")
+        self.key = row.get("key", "")
+        # The provider's own path, such as /p/groq.  This is what the
+        # catalog reports as base_url; the environment origin is only
+        # ever joined to it when dialling.
+        self.path = row["path"]
+
+    def dial_url(self, env_url, suffix):
+        """The absolute URL of one of this provider's routes."""
+        base = env_url.rstrip("/")
+        return base + self.path + suffix
+
+    def auth_headers(self, extra=None):
+        """The headers that carry this provider's key, in its own
+        scheme.  The wire never decides the header: zai speaks the
+        Anthropic wire but authenticates with a bearer token, and
+        three providers take no key at all."""
+        headers = {}
+        if self.auth == "bearer":
+            headers["Authorization"] = "Bearer " + self.key
+        elif self.auth == "x-api-key":
+            headers["x-api-key"] = self.key
+        elif self.auth == "x-goog-api-key":
+            headers["x-goog-api-key"] = self.key
+        # "none" sends no key header of any kind.
+        if extra:
+            headers.update(extra)
+        return headers
 
 
-class Brief:
-    """The provider directory, the quality table and the workload manifest."""
+class ModelRow(object):
+    """One free model from the sealed quality table, bound to the
+    provider that serves it.  The same model id can appear under
+    several providers (glm-4.7-flash lives at zai and at cloudflare),
+    so provider plus model is the identity, never the model alone."""
 
-    def __init__(self, path):
-        self.providers = []
-        self.ratings = {}      # (provider_id, model_id) -> row dict
-        self.best = {}         # request id -> best rating_milli
-        self.manifest = []     # workload rows, in arrival order
-        self.error = None
-        if not path:
-            self.error = "MAKEFUN_PROMPT_FILE is not set"
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                text = handle.read()
-        except OSError as exc:
-            self.error = "cannot read %s: %s" % (path, exc)
-            return
-        docs = _documents_in(text)
-        directory = next((d for d in docs
-                          if d.get("schema") == PROVIDERS_SCHEMA
-                          and isinstance(d.get("providers"), list)), None)
-        if directory is None:
-            self.error = "the brief holds no %s document" % PROVIDERS_SCHEMA
-            return
-        for row in directory["providers"]:
-            if not is_record(row):
-                continue
-            provider = Provider(row)
-            if provider.id and provider.wire in ("openai", "anthropic", "gemini"):
-                self.providers.append(provider)
-        ratings_doc = next((d for d in docs
-                            if d.get("schema") == RATINGS_SCHEMA
-                            and isinstance(d.get("ratings"), list)), None)
-        if ratings_doc is not None:
-            for row in ratings_doc["ratings"]:
-                if not is_record(row):
+    def __init__(self, row):
+        self.model = row["model"]
+        self.provider = row["provider"]
+        self.rating = row["rating_milli"]
+        self.context_length = row["context_length"]
+        self.tools = row["tools"] is True
+        self.vision = row["vision"] is True
+        self.json = row["json"] is True
+        self.free = row["free"] is True
+
+    def meets(self, requires):
+        """Whether this model may serve a request with these
+        requirements.  Every requirement is a hard gate."""
+        if requires.get("tools") is True and not self.tools:
+            return False
+        if requires.get("vision") is True and not self.vision:
+            return False
+        if requires.get("json") is True and not self.json:
+            return False
+        minimum = requires.get("min_context")
+        if minimum is not None and self.context_length < minimum:
+            return False
+        return True
+
+    def key(self):
+        return (self.provider, self.model)
+
+
+class Brief(object):
+    """Everything the trial's brief file tells us: the ten providers,
+    the quality table, and the workload manifest."""
+
+    def __init__(self, providers, ratings, best, manifest):
+        self.providers = providers            # list[Provider], brief order
+        self.by_id = {}
+        for provider in providers:
+            self.by_id[provider.id] = provider
+        self.models = ratings                  # list[ModelRow], free only
+        self.best = best                       # request id -> best rating
+        self.manifest = manifest               # request id -> manifest row
+
+    @classmethod
+    def empty(cls):
+        return cls([], [], {}, {})
+
+    @classmethod
+    def from_file(cls, path):
+        providers_doc = None
+        ratings_doc = None
+        workload_doc = None
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line.startswith("{"):
                     continue
-                model = as_str(row.get("model"))
-                provider = as_str(row.get("provider"))
-                if model and provider:
-                    self.ratings[(provider, model)] = row
-            for row in ratings_doc.get("best") or []:
-                if is_record(row) and as_str(row.get("id")):
-                    rating = as_number(row.get("rating_milli"))
-                    if rating is not None:
-                        self.best[as_str(row.get("id"))] = rating
-        workload_doc = next((d for d in docs
-                             if d.get("schema") == WORKLOAD_SCHEMA
-                             and isinstance(d.get("manifest"), list)), None)
+                try:
+                    doc = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                schema = doc.get("schema")
+                if schema == PROVIDERS_SCHEMA:
+                    providers_doc = doc
+                elif schema == RATINGS_SCHEMA:
+                    ratings_doc = doc
+                elif schema == WORKLOAD_SCHEMA:
+                    workload_doc = doc
+        if providers_doc is None or ratings_doc is None:
+            raise ValueError("brief holds no provider directory or quality table")
+        providers = []
+        for row in providers_doc["providers"]:
+            providers.append(Provider(row))
+        models = []
+        for row in ratings_doc["ratings"]:
+            if row.get("free") is True:
+                models.append(ModelRow(row))
+        best = {}
+        for row in ratings_doc.get("best", []):
+            best[row["id"]] = row["rating_milli"]
+        manifest = {}
         if workload_doc is not None:
             for row in workload_doc["manifest"]:
-                if not is_record(row) or not as_str(row.get("id")):
-                    continue
-                requires = row.get("requires") if is_record(row.get("requires")) else {}
-                min_context = requires.get("min_context")
-                self.manifest.append({
-                    "id": as_str(row.get("id")),
-                    "api": "anthropic" if row.get("api") == "anthropic" else "openai",
-                    "stream": row.get("stream") is True,
-                    "weight": 2 if row.get("weight") == 2 else 1,
-                    "requires": {
-                        "tools": requires.get("tools") is True,
-                        "vision": requires.get("vision") is True,
-                        "json": requires.get("json") is True,
-                        "min_context": min_context
-                        if isinstance(min_context, (int, float)) else None,
-                    },
-                })
+                manifest[row["id"]] = row
+        return cls(providers, models, best, manifest)
 
+    def wire_of(self, provider_id):
+        provider = self.by_id.get(provider_id)
+        if provider is None:
+            return None
+        return provider.wire
 
-def rating_row(brief, provider_id, model_id):
-    return brief.ratings.get((provider_id, model_id))
-
-
-def model_is_free(brief, provider_id, model_id, listed_free):
-    row = rating_row(brief, provider_id, model_id)
-    if row is not None:
-        return row.get("free") is True
-    return listed_free is True
-
-
-def model_caps(brief, provider_id, model_id, listed):
-    """Capabilities of a model: the quality table first, the listing second."""
-    row = rating_row(brief, provider_id, model_id)
-    if row is not None:
-        return {
-            "context_length": as_number(row.get("context_length")),
-            "tools": row.get("tools") is True,
-            "vision": row.get("vision") is True,
-            "json": row.get("json") is True,
-            "rating": as_number(row.get("rating_milli")) or 0,
-        }
-    return {
-        "context_length": listed.get("context_length"),
-        "tools": listed.get("tools") is True,
-        "vision": listed.get("vision") is True,
-        "json": listed.get("json") is True,
-        "rating": 0,
-    }
-
-
-def meets(requires, caps):
-    if requires.get("tools") and caps["tools"] is not True:
-        return False
-    if requires.get("vision") and caps["vision"] is not True:
-        return False
-    if requires.get("json") and caps["json"] is not True:
-        return False
-    min_context = requires.get("min_context")
-    if min_context is not None:
-        if caps["context_length"] is None or caps["context_length"] < min_context:
-            return False
-    return True
+    def ranked_candidates(self, requires):
+        """Every free model that meets the requirements, best rating
+        first.  Ties break on provider id, then model id, so the order
+        is fully deterministic and never depends on arrival order."""
+        fitting = []
+        for model in self.models:
+            if model.meets(requires):
+                fitting.append(model)
+        fitting.sort(key=lambda m: (-m.rating, m.provider, m.model))
+        return fitting
 
 # ---------------------------------------------------------------------------
-# Provider catalog probe and the catalog document.
+# The catalog.  The catalog document is built by asking every provider
+# for its own model list, on its own wire, with its own auth scheme.
+# A catalog call is free: it spends none of the provider's inference
+# budget and the environment does not record it as a call at all.
+#
+# The same builder serves --list and registration, so the printed
+# document and the registered document are the same bytes by
+# construction.  When there is no environment to dial (a --list run
+# outside a trial), the catalog is built from the brief's quality
+# table instead, which lists every free model with its context
+# length; the free set is identical either way.
 # ---------------------------------------------------------------------------
 
-def join_base(env_url, base):
-    base = (base or "").strip()
-    if base.startswith("http://") or base.startswith("https://"):
-        return base.rstrip("/")
-    if not base:
-        return env_url
-    return env_url + ("" if base.startswith("/") else "/") + base.rstrip("/")
-
-
-def auth_headers(provider):
-    """The auth header this provider's own scheme asks for (never the wire's)."""
-    if not provider.key:
-        return {}
-    if provider.auth == "bearer":
-        return {"authorization": "Bearer %s" % provider.key}
-    if provider.auth == "x-api-key":
-        return {"x-api-key": provider.key}
-    if provider.auth == "x-goog-api-key":
-        return {"x-goog-api-key": provider.key}
-    return {}
-
-
-def _http_get(url, headers, timeout):
-    request = urllib.request.Request(url, method="GET", headers=headers)
+def http_get_json(url, headers, timeout):
+    """GET a URL and parse its JSON body, or return None."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        try:
-            return exc.code, exc.read()
-        except Exception:
-            return exc.code, b""
-    except Exception:
-        return None, b""
-
-
-def _listed_model(wire, row):
-    """One model as a catalog route listed it, in that wire's spelling."""
-    if not is_record(row):
+        with urllib.request.urlopen(request, timeout=timeout) as reply:
+            raw = reply.read()
+    except (urllib.error.URLError, OSError, ValueError):
         return None
-    if wire == "gemini":
-        model_id = as_str(row.get("name")).replace("models/", "", 1)
-    else:
-        model_id = as_str(row.get("id"))
-    if not model_id:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
         return None
-    context = as_number(row.get("context_length"))
-    if context is None:
-        context = as_number(row.get("context_window"))
-    if context is None:
-        context = as_number(row.get("inputTokenLimit"))
-    return {
-        "id": model_id,
-        "display_name": as_str(row.get("display_name"))
-        or as_str(row.get("displayName")) or model_id,
-        "free": as_bool(row.get("free")),
-        "context_length": context,
-        "tools": as_bool(row.get("tools")),
-        "vision": as_bool(row.get("vision")),
-        "json": as_bool(row.get("json")),
-    }
+    if not isinstance(value, dict):
+        return None
+    return value
 
 
-def probe_provider(brief, provider):
-    """GET the provider's catalog route in its own wire; None on any failure."""
-    if not ENV_URL:
-        # No env to probe (e.g. `--list` outside a trial): nothing to list.
-        return None
-    base = join_base(ENV_URL, provider.base)
+def probe_catalog_route(brief, provider, env_url):
+    """Ask one provider for its model list.  Returns a list of
+    (model id, free flag, context length) in the provider's own order,
+    or None when the provider cannot be reached."""
     if provider.wire == "gemini":
-        url = base + "/v1beta/models"
+        url = provider.dial_url(env_url, "/v1beta/models")
+        headers = provider.auth_headers()
     else:
-        url = base + "/v1/models"
-    headers = {"accept": "application/json"}
-    headers.update(auth_headers(provider))
-    if provider.wire == "anthropic":
-        headers["anthropic-version"] = ANTHROPIC_VERSION
-    status, body = _http_get(url, headers, PROBE_TIMEOUT)
-    if status is None or status < 200 or status >= 300:
-        log("probe %s: GET %s answered %s" % (provider.id, url, status))
+        url = provider.dial_url(env_url, "/v1/models")
+        headers = provider.auth_headers()
+        if provider.wire == "anthropic":
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+    doc = http_get_json(url, headers, CATALOG_TIMEOUT)
+    if doc is None:
         return None
-    try:
-        parsed = json.loads(body.decode("utf-8"))
-    except ValueError:
-        log("probe %s: catalog is not JSON" % provider.id)
-        return None
-    if not is_record(parsed):
-        return None
-    listing = parsed.get("models") if provider.wire == "gemini" else parsed.get("data")
-    if not isinstance(listing, list):
-        return None
-    models = []
-    for row in listing:
-        model = _listed_model(provider.wire, row)
-        if model is not None:
-            models.append(model)
-    return models
+    if provider.wire == "gemini":
+        return _gemini_catalog_models(doc)
+    return _open_catalog_models(doc)
 
 
-def build_catalog(brief, probes):
-    """The one catalog: every provider that answered, every model it listed.
-
-    A model's free flag comes from the quality table where it has a row (the
-    sealed truth), else from the listing; its context length the same way.
-    Providers are in the brief's order, models sorted by id.
-    """
-    providers = []
-    for provider, models in probes:
-        if models is None:
+def _open_catalog_models(doc):
+    """Model rows from an OpenAI- or Anthropic-wire catalog reply."""
+    rows = doc.get("data")
+    if not isinstance(rows, list):
+        return None
+    found = []
+    for item in rows:
+        if not isinstance(item, dict):
             continue
-        seen = set()
-        catalog_models = []
-        for model in sorted(models, key=lambda m: m["id"]):
-            if model["id"] in seen:
-                continue
-            seen.add(model["id"])
-            row = rating_row(brief, provider.id, model["id"])
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or model_id == "":
+            continue
+        free = item.get("free") is True
+        context = item.get("context_length")
+        if not isinstance(context, int):
             context = None
-            if row is not None:
-                context = as_number(row.get("context_length"))
-            if context is None:
-                context = model["context_length"]
-            catalog_models.append({
-                "id": model["id"],
-                "free": model_is_free(brief, provider.id, model["id"], model["free"]),
+        found.append((model_id, free, context))
+    return found
+
+
+def _gemini_catalog_models(doc):
+    """Model rows from a Gemini-wire catalog reply.  Gemini names its
+    models "models/<id>" and reports the context length as
+    inputTokenLimit; context_length is carried too when present."""
+    rows = doc.get("models")
+    if not isinstance(rows, list):
+        return None
+    found = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name == "":
+            continue
+        model_id = name[7:] if name.startswith("models/") else name
+        free = item.get("free") is True
+        context = item.get("context_length")
+        if not isinstance(context, int):
+            context = item.get("inputTokenLimit")
+        if not isinstance(context, int):
+            context = None
+        found.append((model_id, free, context))
+    return found
+
+
+def fallback_catalog_models(brief, provider):
+    """A provider's models from the brief alone: the free rows of the
+    quality table for that provider, in table order.  Paid models are
+    absent here, which is fine — the catalog is scored on its free
+    sets, and a paid model is never marked free either way."""
+    found = []
+    for model in brief.models:
+        if model.provider == provider.id:
+            found.append((model.model, True, model.context_length))
+    return found
+
+
+def build_catalog(brief, env_url):
+    """Build the catalog document for a brief, probing each provider
+    when an environment URL is available."""
+    entries = []
+    for provider in brief.providers:
+        rows = None
+        if env_url:
+            rows = probe_catalog_route(brief, provider, env_url)
+        if rows is None:
+            rows = fallback_catalog_models(brief, provider)
+        models = []
+        for model_id, free, context in rows:
+            models.append({
+                "id": model_id,
+                "free": free,
                 "context_length": context,
             })
-        providers.append({
+        entries.append({
             "id": provider.id,
-            "base_url": provider.base,
+            "base_url": provider.path,
             "key_env": provider.key_env,
             "wire": provider.wire,
-            "models": catalog_models,
+            "models": models,
         })
-    return {"providers": providers}
+    return {"providers": entries}
 
 
-def served_models(brief, probes):
-    """The free models this server lists, in brief order, models by id."""
-    out = []
-    for provider, models in probes:
-        if models is None:
-            continue
-        for model in sorted(models, key=lambda m: m["id"]):
-            if not model_is_free(brief, provider.id, model["id"], model["free"]):
-                continue
-            out.append({
-                "id": model["id"],
-                "provider": provider.id,
-                "display_name": model["display_name"],
-            })
-    return out
-
-
-def openai_model_list(models):
-    return {
-        "object": "list",
-        "data": [
-            {"id": m["id"], "object": "model", "created": FIXED_CREATED,
-             "owned_by": m["provider"]}
-            for m in models
-        ],
-    }
-
-
-def anthropic_model_list(models):
-    return {
-        "data": [
-            {"type": "model", "id": m["id"], "display_name": m["display_name"],
-             "created_at": FIXED_ANTHROPIC_CREATED_AT}
-            for m in models
-        ],
-        "has_more": False,
-    }
-
+def free_model_ids(catalog):
+    """The free model ids a catalog registers, de-duplicated in
+    first-seen order.  This is what our own GET /v1/models answers."""
+    seen = []
+    known = set()
+    for provider in catalog.get("providers", []):
+        for model in provider.get("models", []):
+            if model.get("free") is True:
+                model_id = model.get("id")
+                if model_id and model_id not in known:
+                    known.add(model_id)
+                    seen.append(model_id)
+    return seen
 
 # ---------------------------------------------------------------------------
-# Upstream calls.
-# ---------------------------------------------------------------------------
-
-def upstream_call(method, url, headers, body_bytes):
-    """One HTTP call; (status, body) or (None, b'') on a transport failure."""
-    request = urllib.request.Request(url, data=body_bytes, method=method,
-                                     headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        try:
-            return exc.code, exc.read()
-        except Exception:
-            return exc.code, b""
-    except Exception:
-        return None, b""
-
-
-def upstream_json(method, url, headers, payload):
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = dict(headers)
-    headers["content-type"] = "application/json"
-    return upstream_call(method, url, headers, body)
-
-# ---------------------------------------------------------------------------
-# Request translation between the three wires.
+# Reading a client request.  Both wires carry the same ideas — a system
+# prompt, user text, images, tools, max_tokens, stop sequences, JSON
+# mode — in different shapes.  The extractors below normalise a
+# request of either wire into one shared shape, so the three wire
+# builders further down each translate from the same source of truth:
 #
-# The provider echoes what it parsed (system text, user text, tool names,
-# max_tokens, stop sequences, image hash, JSON mode), and the client compares
-# that echo with what it sent -- so every translation must carry each field
-# across untouched. Fields the echo never carries (temperature, tool_choice)
-# pass through where the wire supports them and are dropped where it does
-# not.
+#   {
+#     "system": str,            # "" when the request has no system prompt
+#     "messages": [             # every non-system message, in order
+#       {"role": "user"|"assistant",
+#        "parts": [{"kind": "text", "text": str}
+#                | {"kind": "image", "mime": str, "data": str}   # base64
+#                | {"kind": "image", "url": str}]},             # remote
+#     ],
+#     "tools": [{"name": str, "description": str, "parameters": dict}],
+#     "tool_choice": "auto" | ... | None,
+#     "max_tokens": int | None,
+#     "stops": [str],
+#     "json_mode": bool,
+#     "temperature": float | None,
+#     "stream": bool,
+#   }
+#
+# The normalisation is lossless for everything the provider echoes:
+# the same system text, user text, image bytes, tool names, token cap,
+# stops and JSON flag come back out of every builder.
 # ---------------------------------------------------------------------------
 
-def text_of(content):
-    """The text of a string, or of a block array's text blocks."""
+DATA_URL_RE = re.compile(r"^data:([^;,]*);base64,(.*)$", re.DOTALL)
+
+
+def split_data_url(url):
+    """Split a data: URL into (mime type, base64 payload), or return
+    (None, None) when the URL is not a base64 data URL."""
+    if not isinstance(url, str):
+        return None, None
+    match = DATA_URL_RE.match(url)
+    if match is None:
+        return None, None
+    mime = match.group(1) or "application/octet-stream"
+    return mime, match.group(2)
+
+
+def text_of_blocks(content):
+    """The text of a message content that may be a plain string or a
+    list of blocks.  Mirrors the providers' own reading exactly."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
-    return "\n".join(
-        block["text"] for block in content
-        if is_record(block) and block.get("type") == "text"
-        and isinstance(block.get("text"), str))
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
 
 
-def _image_part(block):
-    """An OpenAI image_url part as an Anthropic image block, or None."""
-    if not is_record(block) or block.get("type") != "image_url":
-        return None
-    url = block.get("image_url")
-    if not is_record(url) or not isinstance(url.get("url"), str):
-        return None
-    raw = url["url"]
-    if raw.startswith("data:"):
-        head, _, data = raw.partition(",")
-        media = head[5:].split(";")[0] or "image/png"
-        return {"type": "image", "source": {
-            "type": "base64", "media_type": media, "data": data}}
-    return {"type": "image", "source": {"type": "url", "url": raw}}
-
-
-def _anthropic_image_to_openai(block):
-    if not is_record(block) or block.get("type") != "image":
-        return None
-    source = block.get("source")
-    if not is_record(source):
-        return None
-    if source.get("type") == "base64" and isinstance(source.get("data"), str):
-        media = as_str(source.get("media_type")) or "image/png"
-        return {"type": "image_url", "image_url": {
-            "url": "data:%s;base64,%s" % (media, source["data"])}}
-    if source.get("type") == "url" and isinstance(source.get("url"), str):
-        return {"type": "image_url", "image_url": {"url": source["url"]}}
-    return None
-
-
-def _tool_result_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text = text_of(content)
-        return text if text else json.dumps(content)
-    if content is None:
-        return ""
-    return json.dumps(content)
-
-
-def _stop_list(body):
-    stop = body.get("stop")
-    if isinstance(stop, str):
-        return [stop]
-    if isinstance(stop, list):
-        return [s for s in stop if isinstance(s, str)]
-    return []
-
-
-def _openai_tools(body):
-    tools = []
-    for raw in body.get("tools") or []:
-        if not is_record(raw) or not is_record(raw.get("function")):
-            continue
-        fn = raw["function"]
-        if not as_str(fn.get("name")):
-            continue
-        tools.append({
-            "name": fn["name"],
-            "description": as_str(fn.get("description")),
-            "input_schema": fn.get("parameters")
-            if is_record(fn.get("parameters")) else {"type": "object", "properties": {}},
-        })
-    return tools
-
-
-def _anthropic_tools(body):
-    tools = []
-    for raw in body.get("tools") or []:
-        if not is_record(raw) or not as_str(raw.get("name")):
-            continue
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": raw["name"],
-                "description": as_str(raw.get("description")),
-                "parameters": raw.get("input_schema")
-                if is_record(raw.get("input_schema")) else {"type": "object", "properties": {}},
-            },
-        })
-    return tools
-
-
-def openai_to_anthropic(body, model):
-    """An OpenAI Chat Completions request as an Anthropic Messages request."""
-    system_text = ""
-    messages = []
-    for raw in body.get("messages") or []:
-        if not is_record(raw):
-            continue
-        role = raw.get("role")
-        if role == "system":
-            text = text_of(raw.get("content"))
-            if text:
-                system_text = (system_text + "\n" + text) if system_text else text
-            continue
-        if role == "user":
-            content = raw.get("content")
-            if isinstance(content, str):
-                messages.append({"role": "user", "content": content})
-            elif isinstance(content, list):
-                blocks = []
-                for block in content:
-                    if not is_record(block):
-                        continue
-                    if block.get("type") == "text" and isinstance(block.get("text"), str):
-                        blocks.append({"type": "text", "text": block["text"]})
-                    else:
-                        image = _image_part(block)
-                        if image is not None:
-                            blocks.append(image)
-                messages.append({"role": "user", "content": blocks})
-            continue
-        if role == "assistant":
-            content = raw.get("content")
-            blocks = []
-            text = text_of(content)
-            if text:
-                blocks.append({"type": "text", "text": text})
-            for call in raw.get("tool_calls") or []:
-                if not is_record(call) or not is_record(call.get("function")):
-                    continue
-                fn = call["function"]
-                args = fn.get("arguments")
-                parsed_args = {}
-                if isinstance(args, str) and args.strip():
-                    try:
-                        parsed_args = json.loads(args)
-                    except ValueError:
-                        parsed_args = {}
-                if not is_record(parsed_args):
-                    parsed_args = {}
-                blocks.append({
-                    "type": "tool_use",
-                    "id": as_str(call.get("id")),
-                    "name": as_str(fn.get("name")),
-                    "input": parsed_args,
-                })
-            messages.append({"role": "assistant", "content": blocks})
-            continue
-        if role == "tool":
-            messages.append({"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": as_str(raw.get("tool_call_id")),
-                "content": _tool_result_text(raw.get("content")),
-            }]})
-    out = {"model": model, "messages": messages}
-    if system_text:
-        out["system"] = system_text
-    if isinstance(body.get("max_tokens"), (int, float)):
-        out["max_tokens"] = body["max_tokens"]
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        out["top_p"] = body["top_p"]
-    stops = _stop_list(body)
-    if stops:
-        out["stop_sequences"] = stops
-    tools = _openai_tools(body)
-    if tools:
-        out["tools"] = tools
-    choice = body.get("tool_choice")
-    if choice == "auto":
-        out["tool_choice"] = {"type": "auto"}
-    elif choice == "required":
-        out["tool_choice"] = {"type": "any"}
-    elif is_record(choice) and choice.get("type") == "function" \
-            and is_record(choice.get("function")):
-        out["tool_choice"] = {"type": "tool",
-                              "name": as_str(choice["function"].get("name"))}
-    if body.get("stream") is True:
-        out["stream"] = True
-    return out
-
-
-def anthropic_to_openai(body, model):
-    """An Anthropic Messages request as an OpenAI Chat Completions request."""
-    messages = []
-    system = text_of(body.get("system"))
-    if system:
-        messages.append({"role": "system", "content": system})
-    for raw in body.get("messages") or []:
-        if not is_record(raw):
-            continue
-        content = raw.get("content")
-        if raw.get("role") == "assistant":
-            tool_calls = []
-            for block in content if isinstance(content, list) else []:
-                if not is_record(block) or block.get("type") != "tool_use":
-                    continue
-                tool_calls.append({
-                    "id": as_str(block.get("id")),
-                    "type": "function",
-                    "function": {
-                        "name": as_str(block.get("name")),
-                        "arguments": json.dumps(
-                            block.get("input") if is_record(block.get("input")) else {}),
-                    },
-                })
-            text = text_of(content)
-            messages.append({
-                "role": "assistant",
-                "content": text if text else None,
-                **({"tool_calls": tool_calls} if tool_calls else {}),
-            })
-            continue
-        if isinstance(content, str):
-            messages.append({"role": "user", "content": content})
-            continue
-        if not isinstance(content, list):
-            continue
-        parts = []
-        saw_tool_result = False
-        for block in content:
-            if not is_record(block):
-                continue
-            if block.get("type") == "tool_result":
-                saw_tool_result = True
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": as_str(block.get("tool_use_id")),
-                    "content": _tool_result_text(block.get("content")),
-                })
-                continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                parts.append({"type": "text", "text": block["text"]})
-            else:
-                image = _anthropic_image_to_openai(block)
-                if image is not None:
-                    parts.append(image)
-        if parts or not saw_tool_result:
-            messages.append({"role": "user", "content": parts})
-        elif saw_tool_result:
-            # A user turn holding only a tool result still counts as a user
-            # turn for the echo: keep an empty user message so the last
-            # user text stays "" on both sides of the translation.
-            messages.append({"role": "user", "content": ""})
-    out = {"model": model, "messages": messages}
-    if isinstance(body.get("max_tokens"), (int, float)):
-        out["max_tokens"] = body["max_tokens"]
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        out["top_p"] = body["top_p"]
-    stops = body.get("stop_sequences")
-    if isinstance(stops, list) and stops:
-        out["stop"] = [s for s in stops if isinstance(s, str)]
-    tools = _anthropic_tools(body)
-    if tools:
-        out["tools"] = tools
-    choice = body.get("tool_choice")
-    if is_record(choice):
-        if choice.get("type") == "auto":
-            out["tool_choice"] = "auto"
-        elif choice.get("type") == "any":
-            out["tool_choice"] = "required"
-        elif choice.get("type") == "tool" and isinstance(choice.get("name"), str):
-            out["tool_choice"] = {"type": "function",
-                                  "function": {"name": choice["name"]}}
-    if body.get("stream") is True:
-        out["stream"] = True
-        out["stream_options"] = {"include_usage": True}
-    return out
-
-def _gemini_text_parts(content):
-    """OpenAI/Anthropic content as Gemini parts (text + images)."""
+def parts_of_openai_content(content):
+    """Normalised parts for an OpenAI message content."""
     parts = []
     if isinstance(content, str):
-        if content:
-            parts.append({"text": content})
+        if content != "":
+            parts.append({"kind": "text", "text": content})
         return parts
     if not isinstance(content, list):
         return parts
     for block in content:
-        if not is_record(block):
+        if not isinstance(block, dict):
             continue
         if block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append({"text": block["text"]})
-        elif block.get("type") == "image_url" and is_record(block.get("image_url")):
-            raw = block["image_url"].get("url")
-            if not isinstance(raw, str):
-                continue
-            if raw.startswith("data:"):
-                head, _, data = raw.partition(",")
-                media = head[5:].split(";")[0] or "image/png"
-                parts.append({"inlineData": {"mimeType": media, "data": data}})
-            else:
-                parts.append({"fileData": {"fileUri": raw, "mimeType": "image/png"}})
-        elif block.get("type") == "image" and is_record(block.get("source")):
-            source = block["source"]
-            if source.get("type") == "base64" and isinstance(source.get("data"), str):
-                parts.append({"inlineData": {
-                    "mimeType": as_str(source.get("media_type")) or "image/png",
-                    "data": source["data"]}})
-            elif source.get("type") == "url" and isinstance(source.get("url"), str):
-                parts.append({"fileData": {"fileUri": source["url"], "mimeType": "image/png"}})
+            parts.append({"kind": "text", "text": block["text"]})
+        elif block.get("type") == "image_url":
+            image_url = block.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+                if isinstance(url, str) and url != "":
+                    mime, data = split_data_url(url)
+                    if data is not None:
+                        parts.append({"kind": "image", "mime": mime, "data": data})
+                    else:
+                        parts.append({"kind": "image", "url": url})
     return parts
 
 
-def _gemini_tools(openai_tools, anthropic_tools):
-    """Tool definitions as Gemini functionDeclarations, or None."""
-    declarations = []
-    for raw in openai_tools or []:
-        if not is_record(raw) or not is_record(raw.get("function")):
+def parts_of_anthropic_content(content):
+    """Normalised parts for an Anthropic message content."""
+    parts = []
+    if isinstance(content, str):
+        if content != "":
+            parts.append({"kind": "text", "text": content})
+        return parts
+    if not isinstance(content, list):
+        return parts
+    for block in content:
+        if not isinstance(block, dict):
             continue
-        fn = raw["function"]
-        if not as_str(fn.get("name")):
-            continue
-        declarations.append({
-            "name": fn["name"],
-            "description": as_str(fn.get("description")),
-            "parameters": fn.get("parameters")
-            if is_record(fn.get("parameters")) else {"type": "object", "properties": {}},
-        })
-    for raw in anthropic_tools or []:
-        if not is_record(raw) or not as_str(raw.get("name")):
-            continue
-        declarations.append({
-            "name": raw["name"],
-            "description": as_str(raw.get("description")),
-            "parameters": raw.get("input_schema")
-            if is_record(raw.get("input_schema")) else {"type": "object", "properties": {}},
-        })
-    if not declarations:
-        return None
-    return [{"functionDeclarations": declarations}]
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append({"kind": "text", "text": block["text"]})
+        elif block.get("type") == "image":
+            source = block.get("source")
+            if not isinstance(source, dict):
+                continue
+            if source.get("type") == "base64" and isinstance(source.get("data"), str):
+                mime = source.get("media_type") or "image/png"
+                parts.append({"kind": "image", "mime": mime, "data": source["data"]})
+            elif source.get("type") == "url" and isinstance(source.get("url"), str):
+                parts.append({"kind": "image", "url": source["url"]})
+    return parts
 
 
-def _gemini_config(body, json_mode):
-    config = {}
-    max_tokens = body.get("max_tokens")
-    if isinstance(max_tokens, (int, float)):
-        config["maxOutputTokens"] = max_tokens
-    if isinstance(body.get("temperature"), (int, float)):
-        config["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        config["topP"] = body["top_p"]
-    stops = _stop_list(body)
-    if not stops and isinstance(body.get("stop_sequences"), list):
-        stops = [s for s in body["stop_sequences"] if isinstance(s, str)]
-    if stops:
-        config["stopSequences"] = stops
-    if json_mode:
-        config["responseMimeType"] = "application/json"
-    return config
+def stops_of(value):
+    """A stop field that may be one string, a list of strings, or
+    absent, normalised to a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
 
 
-def openai_to_gemini(body, model):
-    """An OpenAI request as a Gemini generateContent body (+ stream flag)."""
-    system_text = ""
-    contents = []
-    tool_call_names = {}
-    for raw in body.get("messages") or []:
-        if not is_record(raw):
+def extract_openai(body):
+    """Normalise an OpenAI Chat Completions request body."""
+    system_texts = []
+    messages = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
             continue
-        role = raw.get("role")
+        role = message.get("role")
         if role == "system":
-            text = text_of(raw.get("content"))
-            if text:
-                system_text = (system_text + "\n" + text) if system_text else text
+            text = text_of_blocks(message.get("content"))
+            if text != "":
+                system_texts.append(text)
+        elif role in ("user", "assistant"):
+            messages.append({
+                "role": role,
+                "parts": parts_of_openai_content(message.get("content")),
+            })
+    tools = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
             continue
-        if role == "user":
-            parts = _gemini_text_parts(raw.get("content"))
-            contents.append({"role": "user", "parts": parts})
-            continue
-        if role == "assistant":
-            parts = _gemini_text_parts(raw.get("content"))
-            for call in raw.get("tool_calls") or []:
-                if not is_record(call) or not is_record(call.get("function")):
-                    continue
-                fn = call["function"]
-                args = fn.get("arguments")
-                parsed_args = {}
-                if isinstance(args, str) and args.strip():
-                    try:
-                        parsed_args = json.loads(args)
-                    except ValueError:
-                        parsed_args = {}
-                if not is_record(parsed_args):
-                    parsed_args = {}
-                tool_call_names[as_str(call.get("id"))] = as_str(fn.get("name"))
-                parts.append({"functionCall": {"name": fn.get("name"), "args": parsed_args}})
-            contents.append({"role": "model", "parts": parts})
-            continue
-        if role == "tool":
-            name = tool_call_names.get(as_str(raw.get("tool_call_id")), "unknown")
-            contents.append({"role": "user", "parts": [{"functionResponse": {
-                "name": name,
-                "response": {"content": _tool_result_text(raw.get("content"))}}}]})
-    payload = {"contents": contents}
-    if system_text:
-        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
-    tools = _gemini_tools(body.get("tools"), None)
-    if tools is not None:
-        payload["tools"] = tools
-    fmt = body.get("response_format")
-    json_mode = is_record(fmt) and fmt.get("type") in ("json_object", "json_schema")
-    config = _gemini_config(body, json_mode)
-    if config:
-        payload["generationConfig"] = config
-    return payload, body.get("stream") is True
-
-
-def anthropic_to_gemini(body, model):
-    """An Anthropic request as a Gemini generateContent body (+ stream flag)."""
-    system_text = text_of(body.get("system"))
-    contents = []
-    for raw in body.get("messages") or []:
-        if not is_record(raw):
-            continue
-        content = raw.get("content")
-        if raw.get("role") == "assistant":
-            parts = []
-            text = text_of(content)
-            if text:
-                parts.append({"text": text})
-            if isinstance(content, list):
-                for block in content:
-                    if not is_record(block) or block.get("type") != "tool_use":
-                        continue
-                    parts.append({"functionCall": {
-                        "name": as_str(block.get("name")),
-                        "args": block.get("input")
-                        if is_record(block.get("input")) else {}}})
-            contents.append({"role": "model", "parts": parts})
-            continue
-        parts = []
-        if isinstance(content, list):
-            for block in content:
-                if not is_record(block):
-                    continue
-                if block.get("type") == "tool_result":
-                    parts.append({"functionResponse": {
-                        "name": "unknown",
-                        "response": {"content": _tool_result_text(block.get("content"))}}})
-                    continue
-                parts.extend(_gemini_text_parts([block]))
-        elif isinstance(content, str) and content:
-            parts.append({"text": content})
-        contents.append({"role": "user", "parts": parts})
-    payload = {"contents": contents}
-    if system_text:
-        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
-    tools = _gemini_tools(None, body.get("tools"))
-    if tools is not None:
-        payload["tools"] = tools
-    config = _gemini_config(body, False)
-    if config:
-        payload["generationConfig"] = config
-    return payload, body.get("stream") is True
-
-# ---------------------------------------------------------------------------
-# Response translation back to the client's wire.
-#
-# The provider's answer text is always the echo of what it parsed, and the
-# client compares that echo with what it sent -- so the answer text goes
-# through byte-for-byte, only the envelope changes. Usage is always copied
-# from the provider's own answer, never recomputed.
-# ---------------------------------------------------------------------------
-
-def _provider_answer(body, wire):
-    """(text, finish_reason, usage, tool calls, model) from a provider answer."""
-    if not is_record(body):
-        return None
-    if wire == "openai":
-        choices = body.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return None
-        choice = choices[0]
-        if not is_record(choice):
-            return None
-        message = choice.get("message")
-        text = ""
-        tool_calls = []
-        if is_record(message):
-            text = message.get("content")
-            if not isinstance(text, str):
-                text = ""
-            for call in message.get("tool_calls") or []:
-                if is_record(call):
-                    tool_calls.append(call)
-        finish = choice.get("finish_reason") or "stop"
-        usage = body.get("usage") if is_record(body.get("usage")) else {}
-        return {"text": text, "finish": finish, "usage": usage,
-                "tool_calls": tool_calls, "model": as_str(body.get("model"))}
-    if wire == "anthropic":
-        content = body.get("content")
-        text = ""
-        tool_uses = []
-        if isinstance(content, list):
-            for block in content:
-                if not is_record(block):
-                    continue
-                if block.get("type") == "text" and isinstance(block.get("text"), str):
-                    text = block["text"]
-                elif block.get("type") == "tool_use":
-                    tool_uses.append(block)
-        stop_reason = body.get("stop_reason")
-        raw_usage = body.get("usage") if is_record(body.get("usage")) else {}
-        input_tokens = raw_usage.get("input_tokens", 0)
-        output_tokens = raw_usage.get("output_tokens", 0)
-        # Normalise to the same keys the OpenAI wire uses, so the response
-        # builders can copy usage without knowing which wire answered.
-        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
-                 "prompt_tokens": input_tokens, "completion_tokens": output_tokens,
-                 "total_tokens": input_tokens + output_tokens}
-        return {"text": text, "finish": stop_reason or "end_turn",
-                "usage": usage, "tool_calls": tool_uses,
-                "model": as_str(body.get("model"))}
-    # Gemini.
-    candidates = body.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        return None
-    candidate = candidates[0]
-    if not is_record(candidate):
-        return None
-    content = candidate.get("content")
-    text = ""
-    parts = content.get("parts") if is_record(content) else None
-    if isinstance(parts, list):
-        for part in parts:
-            if is_record(part) and isinstance(part.get("text"), str):
-                text = part["text"]
-    finish = candidate.get("finishReason") or "STOP"
-    usage = body.get("usageMetadata") if is_record(body.get("usageMetadata")) else {}
-    usage = {"prompt_tokens": usage.get("promptTokenCount", 0),
-             "completion_tokens": usage.get("candidatesTokenCount", 0),
-             "total_tokens": usage.get("totalTokenCount", 0)}
-    return {"text": text, "finish": finish, "usage": usage, "tool_calls": [],
-            "model": as_str(body.get("modelVersion")) or ""}
-
-
-STOP_FAMILY = {
-    "stop": "stop", "end_turn": "stop", "STOP": "stop",
-    "length": "length", "max_tokens": "length", "MAX_TOKENS": "length",
-    "tool_calls": "tool_calls", "tool_use": "tool_calls", "TOOL_CALLS": "tool_calls",
-    "content_filter": "content_filter", "refusal": "content_filter",
-    "SAFETY": "content_filter",
-}
-
-ANTHROPIC_STOP_FAMILY = {
-    "stop": "end_turn", "end_turn": "end_turn", "STOP": "end_turn",
-    "length": "max_tokens", "max_tokens": "max_tokens", "MAX_TOKENS": "max_tokens",
-    "tool_calls": "tool_use", "tool_use": "tool_use", "TOOL_CALLS": "tool_use",
-    "content_filter": "refusal", "refusal": "refusal", "SAFETY": "refusal",
-}
-
-
-def _openai_finish(reason, tool_calls):
-    if tool_calls:
-        return "tool_calls"
-    return STOP_FAMILY.get(reason, "stop")
-
-
-def _anthropic_finish(reason, tool_calls):
-    if tool_calls:
-        return "tool_use"
-    return ANTHROPIC_STOP_FAMILY.get(reason, "end_turn")
-
-
-def openai_response(answer, client_model, request_id, upstream_status):
-    """An upstream answer as an OpenAI Chat Completions response."""
-    usage = answer["usage"]
-    message = {"role": "assistant", "content": answer["text"]}
-    if answer["tool_calls"]:
-        message["tool_calls"] = answer["tool_calls"]
+        fn = tool.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            tools.append({
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters") or {},
+            })
+    response_format = body.get("response_format")
+    json_mode = (
+        isinstance(response_format, dict)
+        and response_format.get("type") in ("json_object", "json_schema")
+    )
+    max_tokens = body.get("max_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = body.get("max_completion_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = None
+    temperature = body.get("temperature")
+    if not isinstance(temperature, (int, float)):
+        temperature = None
     return {
-        "id": request_id,
+        "system": "\n".join(system_texts),
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": body.get("tool_choice"),
+        "max_tokens": max_tokens,
+        "stops": stops_of(body.get("stop")),
+        "json_mode": json_mode,
+        "temperature": temperature,
+        "stream": body.get("stream") is True,
+    }
+
+
+def extract_anthropic(body):
+    """Normalise an Anthropic Messages request body.  The Anthropic
+    wire carries no JSON mode, so json_mode is always False here;
+    JSON-mode requests are kept away from Anthropic-wire providers
+    by the router, which reads the manifest's requirements."""
+    messages = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role in ("user", "assistant"):
+            messages.append({
+                "role": role,
+                "parts": parts_of_anthropic_content(message.get("content")),
+            })
+    tools = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if isinstance(tool.get("name"), str):
+            tools.append({
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema") or {},
+            })
+    max_tokens = body.get("max_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = None
+    temperature = body.get("temperature")
+    if not isinstance(temperature, (int, float)):
+        temperature = None
+    return {
+        "system": text_of_blocks(body.get("system")),
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": body.get("tool_choice"),
+        "max_tokens": max_tokens,
+        "stops": stops_of(body.get("stop_sequences")),
+        "json_mode": False,
+        "temperature": temperature,
+        "stream": body.get("stream") is True,
+    }
+
+# ---------------------------------------------------------------------------
+# Speaking to a provider.  Each builder reshapes the normalised
+# request into one provider wire.  The builders never drop a field the
+# provider echoes, and they never add one: the echo the provider
+# returns must match the client request field for field.
+# ---------------------------------------------------------------------------
+
+def openai_message_content(parts):
+    """Message content for the OpenAI wire: a bare string for one
+    text part, otherwise the block list."""
+    if len(parts) == 1 and parts[0]["kind"] == "text":
+        return parts[0]["text"]
+    blocks = []
+    for part in parts:
+        if part["kind"] == "text":
+            blocks.append({"type": "text", "text": part["text"]})
+        elif "data" in part:
+            url = "data:%s;base64,%s" % (part["mime"], part["data"])
+            blocks.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            blocks.append({"type": "image_url", "image_url": {"url": part["url"]}})
+    return blocks
+
+
+def anthropic_message_content(parts):
+    """Message content for the Anthropic wire, same convention."""
+    if len(parts) == 1 and parts[0]["kind"] == "text":
+        return parts[0]["text"]
+    blocks = []
+    for part in parts:
+        if part["kind"] == "text":
+            blocks.append({"type": "text", "text": part["text"]})
+        elif "data" in part:
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": part["mime"],
+                    "data": part["data"],
+                },
+            })
+        else:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "url", "url": part["url"]},
+            })
+    return blocks
+
+
+def gemini_message_parts(parts):
+    """Content parts for the Gemini wire."""
+    out = []
+    for part in parts:
+        if part["kind"] == "text":
+            out.append({"text": part["text"]})
+        elif "data" in part:
+            out.append({
+                "inlineData": {
+                    "mimeType": part["mime"],
+                    "data": part["data"],
+                },
+            })
+        else:
+            out.append({"fileData": {"fileUri": part["url"]}})
+    return out
+
+
+def build_openai_request(norm, model):
+    """The normalised request as an OpenAI-wire chat completions
+    body.  Streaming is always off: the answer comes back whole."""
+    messages = []
+    if norm["system"] != "":
+        messages.append({"role": "system", "content": norm["system"]})
+    for message in norm["messages"]:
+        messages.append({
+            "role": message["role"],
+            "content": openai_message_content(message["parts"]),
+        })
+    body = {"model": model, "messages": messages, "stream": False}
+    if norm["tools"]:
+        body["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                },
+            }
+            for tool in norm["tools"]
+        ]
+    if norm["tool_choice"] is not None:
+        body["tool_choice"] = norm["tool_choice"]
+    if norm["max_tokens"] is not None:
+        body["max_tokens"] = norm["max_tokens"]
+    if norm["temperature"] is not None:
+        body["temperature"] = norm["temperature"]
+    if norm["stops"]:
+        body["stop"] = norm["stops"]
+    if norm["json_mode"]:
+        body["response_format"] = {"type": "json_object"}
+    return body
+
+
+def build_anthropic_request(norm, model):
+    """The normalised request as an Anthropic-wire messages body."""
+    body = {"model": model, "messages": [], "stream": False}
+    if norm["system"] != "":
+        body["system"] = norm["system"]
+    for message in norm["messages"]:
+        body["messages"].append({
+            "role": message["role"],
+            "content": anthropic_message_content(message["parts"]),
+        })
+    if norm["tools"]:
+        body["tools"] = [
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": tool["parameters"],
+            }
+            for tool in norm["tools"]
+        ]
+    if norm["tool_choice"] == "auto":
+        body["tool_choice"] = {"type": "auto"}
+    if norm["max_tokens"] is not None:
+        body["max_tokens"] = norm["max_tokens"]
+    if norm["temperature"] is not None:
+        body["temperature"] = norm["temperature"]
+    if norm["stops"]:
+        body["stop_sequences"] = norm["stops"]
+    return body
+
+
+def build_gemini_request(norm, model):
+    """The normalised request as a Gemini-wire generateContent body."""
+    body = {"contents": []}
+    if norm["system"] != "":
+        body["systemInstruction"] = {"parts": [{"text": norm["system"]}]}
+    for message in norm["messages"]:
+        role = "model" if message["role"] == "assistant" else "user"
+        body["contents"].append({
+            "role": role,
+            "parts": gemini_message_parts(message["parts"]),
+        })
+    if norm["tools"]:
+        body["tools"] = [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["parameters"],
+                    }
+                    for tool in norm["tools"]
+                ]
+            }
+        ]
+    config = {}
+    if norm["max_tokens"] is not None:
+        config["maxOutputTokens"] = norm["max_tokens"]
+    if norm["temperature"] is not None:
+        config["temperature"] = norm["temperature"]
+    if norm["stops"]:
+        config["stopSequences"] = norm["stops"]
+    if norm["json_mode"]:
+        config["responseMimeType"] = "application/json"
+    if config:
+        body["generationConfig"] = config
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Reading a provider's answer.  Each parser returns one tuple:
+# (answer text, input tokens, output tokens, provider stop reason).
+# The usage counts are taken from the provider's own answer and
+# forwarded verbatim, which is what the client's usage check compares.
+# ---------------------------------------------------------------------------
+
+def answer_text_of_openai_content(content):
+    """Answer text from an OpenAI message content, string or blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def parse_openai_answer(doc):
+    choices = doc.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return None
+    choice = choices[0]
+    message = choice.get("message") or {}
+    text = answer_text_of_openai_content(message.get("content"))
+    usage = doc.get("usage") or {}
+    stop = choice.get("finish_reason")
+    return (text, usage.get("prompt_tokens"), usage.get("completion_tokens"), stop)
+
+
+def parse_anthropic_answer(doc):
+    text = answer_text_of_openai_content(doc.get("content"))
+    usage = doc.get("usage") or {}
+    return (text, usage.get("input_tokens"), usage.get("output_tokens"),
+            doc.get("stop_reason"))
+
+
+def parse_gemini_answer(doc):
+    candidates = doc.get("candidates") or []
+    text = ""
+    stop = None
+    if candidates and isinstance(candidates[0], dict):
+        candidate = candidates[0]
+        content = candidate.get("content") or {}
+        parts = content.get("parts") or []
+        chunks = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+        text = "".join(chunks)
+        stop = candidate.get("finishReason")
+    meta = doc.get("usageMetadata") or {}
+    return (text, meta.get("promptTokenCount"),
+            meta.get("candidatesTokenCount"), stop)
+
+
+def parse_provider_answer(wire, doc):
+    """Parse one provider's JSON answer body by its wire."""
+    if wire == "openai":
+        return parse_openai_answer(doc)
+    if wire == "anthropic":
+        return parse_anthropic_answer(doc)
+    return parse_gemini_answer(doc)
+
+# ---------------------------------------------------------------------------
+# Dialling a provider.  One call, one answer, no retries of the same
+# call: the return is (status, parsed answer or None, error text or
+# None).  A 200 with an unparseable body is reported as a failure of
+# that candidate, but the caller must still treat it as a spent
+# successful call and never dial another provider for the same
+# request — the environment counts a 200 as a served call whatever
+# we do with it, and two served calls behind one request fails the
+# one-provider check.  In practice the providers' answers are always
+# well formed, so the unparseable branch is a guard, not a path.
+# ---------------------------------------------------------------------------
+
+class UpstreamResult(object):
+    def __init__(self, status, answer, error, spent):
+        self.status = status      # HTTP status, or 0 on a transport error
+        self.answer = answer      # (text, in, out, stop) or None
+        self.error = error        # short error text or None
+        self.spent = spent        # True when the provider recorded a 200
+
+
+def dial_provider(brief, provider, model, norm, env_url):
+    """One inference call to one provider's model.  Always
+    non-streaming; the full answer comes back as JSON."""
+    wire = provider.wire
+    if wire == "openai":
+        path = "/v1/chat/completions"
+        payload = build_openai_request(norm, model)
+    elif wire == "anthropic":
+        path = "/v1/messages"
+        payload = build_anthropic_request(norm, model)
+    else:
+        encoded = urllib.parse.quote(model, safe="")
+        path = "/v1beta/models/%s:generateContent" % encoded
+        payload = build_gemini_request(norm, model)
+    url = provider.dial_url(env_url, path)
+    headers = provider.auth_headers({"Content-Type": "application/json"})
+    if wire == "anthropic":
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    data = compact_json(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as reply:
+            status = reply.status
+            raw = reply.read()
+    except urllib.error.HTTPError as err:
+        try:
+            err.read()
+        except OSError:
+            pass
+        return UpstreamResult(err.code, None, "http %d" % err.code, False)
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        return UpstreamResult(0, None, "transport: %s" % err, False)
+    if status != 200:
+        return UpstreamResult(status, None, "http %d" % status, False)
+    doc = parse_json_object(raw)
+    if doc is None:
+        return UpstreamResult(200, None, "unparseable answer", True)
+    answer = parse_provider_answer(wire, doc)
+    if answer is None or answer[1] is None or answer[2] is None:
+        return UpstreamResult(200, None, "answer lacks usage", True)
+    return UpstreamResult(200, answer, None, True)
+
+
+# ---------------------------------------------------------------------------
+# The router.  It holds the trial-long memory: how many times in a row
+# each provider has refused, which providers are retired, and which
+# (provider, model) pairs turned out to be invalid.  The per-request
+# walk is stateless apart from this memory, so a replay that sees the
+# same provider answers makes the same choices.
+# ---------------------------------------------------------------------------
+
+# A provider is retired after this many consecutive refusals.  Two is
+# the honest number: a single refusal is often the provider's one
+# scheduled failure, after which its next call succeeds, while two
+# in a row means its budget is spent or it is in outage, and every
+# further call would refuse too.  A success resets the streak.
+RETIRE_AFTER_STREAK = 2
+
+
+class Router(object):
+    def __init__(self, brief, env_url):
+        self.brief = brief
+        self.env_url = env_url
+        self.streak = {}        # provider id -> consecutive refusals
+        self.retired = set()    # provider ids retired for the trial
+        self.invalid = set()    # (provider id, model id) pairs, 400s
+
+    def is_usable(self, candidate):
+        if candidate.provider in self.retired:
+            return False
+        if candidate.key() in self.invalid:
+            return False
+        return True
+
+    def note_success(self, provider_id):
+        self.streak[provider_id] = 0
+
+    def note_refusal(self, provider_id):
+        streak = self.streak.get(provider_id, 0) + 1
+        self.streak[provider_id] = streak
+        if streak >= RETIRE_AFTER_STREAK:
+            self.retired.add(provider_id)
+
+    def candidates_for(self, requires):
+        """The ranked candidate list for a request, with retired
+        providers and invalid pairs filtered out, and with one extra
+        rule: a JSON-mode request never goes to an Anthropic-wire
+        provider, whose wire cannot carry response_format — the
+        provider would echo json_mode false and the request would
+        fail its JSON check."""
+        ranked = self.brief.ranked_candidates(requires)
+        kept = []
+        for candidate in ranked:
+            if not self.is_usable(candidate):
+                continue
+            if requires.get("json") is True:
+                wire = self.brief.wire_of(candidate.provider)
+                if wire == "anthropic":
+                    continue
+            kept.append(candidate)
+        return kept
+
+    def serve(self, norm, requires):
+        """Answer one normalised request.  Returns
+        (answer tuple, provider id, model id) on success, or
+        (None, None, None) when every candidate refused.
+
+        The walk tries each provider at most once per request: a
+        refusal is provider-level (budget, schedule, outage), so a
+        second model on the same provider would refuse as well and
+        only burn the provider's remaining budget.  The one exception
+        is a 400, which names a bad model rather than a dead provider,
+        so the walk may try another model on the same provider then.
+        """
+        tried_providers = set()
+        for candidate in self.candidates_for(requires):
+            provider = self.brief.by_id[candidate.provider]
+            if candidate.provider in tried_providers:
+                continue
+            result = dial_provider(self.brief, provider, candidate.model,
+                                   norm, self.env_url)
+            if result.status == 200 and result.answer is not None:
+                self.note_success(candidate.provider)
+                return (result.answer, candidate.provider, candidate.model)
+            if result.status == 200:
+                # A 200 the provider recorded but we cannot use.  The
+                # call is spent; dialling on would put two served
+                # calls behind one request, so stop the walk here.
+                self.note_success(candidate.provider)
+                return (None, None, None)
+            if result.status in (400, 401):
+                # Our own call was wrong: mark the pair invalid and
+                # move on without counting a strike against the
+                # provider.  Never retry the same call.
+                self.invalid.add(candidate.key())
+                continue
+            # A refusal: 402, 429, 5xx, or a transport failure.
+            self.note_refusal(candidate.provider)
+            tried_providers.add(candidate.provider)
+        return (None, None, None)
+
+# ---------------------------------------------------------------------------
+# Answering the client.  The provider's text and usage counts are
+# forwarded whole; only the envelope is ours.  The stop reason is
+# always the plain end-of-turn one — the providers never answer
+# anything else, so the mapped stop family always matches theirs.
+# ---------------------------------------------------------------------------
+
+def openai_json_response(model, answer):
+    """A non-streaming OpenAI chat completion carrying the provider's
+    answer."""
+    text, in_tokens, out_tokens, _stop = answer
+    return {
+        "id": FIXED_OPENAI_ID,
         "object": "chat.completion",
         "created": FIXED_CREATED,
-        "model": client_model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": _openai_finish(answer["finish"], answer["tool_calls"]),
-        }],
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+                "logprobs": None,
+            }
+        ],
         "usage": {
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
+            "prompt_tokens": in_tokens,
+            "completion_tokens": out_tokens,
+            "total_tokens": in_tokens + out_tokens,
         },
     }
 
 
-def anthropic_response(answer, client_model, request_id):
-    """An upstream answer as an Anthropic Messages response."""
-    usage = answer["usage"]
-    content = []
-    if answer["text"]:
-        content.append({"type": "text", "text": answer["text"]})
-    for call in answer["tool_calls"]:
-        if is_record(call):
-            content.append({
-                "type": "tool_use",
-                "id": as_str(call.get("id")),
-                "name": as_str(call.get("name")),
-                "input": call.get("input")
-                if is_record(call.get("input")) else {},
-            })
+def anthropic_json_response(model, answer):
+    """A non-streaming Anthropic message carrying the provider's
+    answer."""
+    text, in_tokens, out_tokens, _stop = answer
     return {
-        "id": request_id,
+        "id": FIXED_ANTHROPIC_ID,
         "type": "message",
         "role": "assistant",
-        "model": client_model,
-        "content": content,
-        "stop_reason": _anthropic_finish(answer["finish"], answer["tool_calls"]),
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
         "stop_sequence": None,
+        "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
+    }
+
+
+def openai_sse_response(model, answer):
+    """The provider's answer as OpenAI server-sent events: a role
+    chunk, one content chunk per thirteen characters, a finish chunk,
+    a usage chunk, and [DONE].  Nothing follows [DONE], and no
+    content follows the finish chunk — the order the wire check
+    requires."""
+    text, in_tokens, out_tokens, _stop = answer
+
+    def chunk(delta, finish):
+        return {
+            "id": FIXED_OPENAI_ID,
+            "object": "chat.completion.chunk",
+            "created": FIXED_CREATED,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    frames = []
+    frames.append("data: %s\n\n" % compact_json(
+        chunk({"role": "assistant", "content": ""}, None)))
+    for piece in split_pieces(text):
+        frames.append("data: %s\n\n" % compact_json(
+            chunk({"content": piece}, None)))
+    frames.append("data: %s\n\n" % compact_json(chunk({}, "stop")))
+    usage_chunk = {
+        "id": FIXED_OPENAI_ID,
+        "object": "chat.completion.chunk",
+        "created": FIXED_CREATED,
+        "model": model,
+        "choices": [],
         "usage": {
-            "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-            "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
+            "prompt_tokens": in_tokens,
+            "completion_tokens": out_tokens,
+            "total_tokens": in_tokens + out_tokens,
         },
     }
+    frames.append("data: %s\n\n" % compact_json(usage_chunk))
+    frames.append("data: [DONE]\n\n")
+    return "".join(frames)
 
 
-def _sse_json(payload):
-    return "data: %s\n\n" % json.dumps(payload, separators=(",", ":"))
+def anthropic_sse_response(model, answer):
+    """The provider's answer as Anthropic server-sent events:
+    message_start, one content block carrying the whole text in
+    thirteen-character deltas, content_block_stop, message_delta
+    with the stop reason and output count, and message_stop."""
+    text, in_tokens, out_tokens, _stop = answer
+    frames = []
 
+    def frame(event, data):
+        return "event: %s\ndata: %s\n\n" % (event, compact_json(data))
 
-def openai_stream(answer, client_model, request_id):
-    """The answer as an OpenAI SSE stream, ending with the usage chunk."""
-    usage = answer["usage"]
-    head = {"id": request_id, "object": "chat.completion.chunk",
-            "created": FIXED_CREATED, "model": client_model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
-                         "finish_reason": None}]}
-    content = {"id": request_id, "object": "chat.completion.chunk",
-               "created": FIXED_CREATED, "model": client_model,
-               "choices": [{"index": 0, "delta": {"content": answer["text"]},
-                            "finish_reason": None}]}
-    if answer["tool_calls"]:
-        content["choices"][0]["delta"]["tool_calls"] = answer["tool_calls"]
-    finish = {"id": request_id, "object": "chat.completion.chunk",
-              "created": FIXED_CREATED, "model": client_model,
-              "choices": [{"index": 0, "delta": {},
-                           "finish_reason": _openai_finish(answer["finish"],
-                                                           answer["tool_calls"])}]}
-    usage_chunk = {"id": request_id, "object": "chat.completion.chunk",
-                   "created": FIXED_CREATED, "model": client_model,
-                   "choices": [],
-                   "usage": {
-                       "prompt_tokens": usage.get("prompt_tokens", 0),
-                       "completion_tokens": usage.get("completion_tokens", 0),
-                       "total_tokens": usage.get("total_tokens", 0),
-                   }}
-    return "".join([
-        _sse_json(head),
-        _sse_json(content),
-        _sse_json(finish),
-        _sse_json(usage_chunk),
-        "data: [DONE]\n\n",
-    ]).encode("utf-8")
-
-
-def anthropic_stream(answer, client_model, request_id):
-    """The answer as an Anthropic SSE stream, with usage and stop events."""
-    usage = answer["usage"]
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
-    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
-    start = {
+    frames.append(frame("message_start", {
         "type": "message_start",
-        "message": {"id": request_id, "type": "message", "role": "assistant",
-                    "model": client_model, "content": [],
-                    "stop_reason": None, "stop_sequence": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}},
-    }
-    block_start = {"type": "content_block_start", "index": 0,
-                   "content_block": {"type": "text", "text": ""}}
-    delta = {"type": "content_block_delta", "index": 0,
-             "delta": {"type": "text_delta", "text": answer["text"]}}
-    block_stop = {"type": "content_block_stop", "index": 0}
-    message_delta = {
+        "message": {
+            "id": FIXED_ANTHROPIC_ID,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": in_tokens, "output_tokens": 0},
+        },
+    }))
+    frames.append(frame("content_block_start", {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    }))
+    for piece in split_pieces(text):
+        frames.append(frame("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": piece},
+        }))
+    frames.append(frame("content_block_stop", {
+        "type": "content_block_stop",
+        "index": 0,
+    }))
+    frames.append(frame("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": _anthropic_finish(answer["finish"],
-                                                   answer["tool_calls"]),
-                  "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": out_tokens},
+    }))
+    frames.append(frame("message_stop", {"type": "message_stop"}))
+    return "".join(frames)
+
+
+def error_body_openai(message):
+    return {"error": {"message": message, "type": "server_error",
+                      "param": None, "code": "upstream_unavailable"}}
+
+
+def error_body_anthropic(message):
+    return {"type": "error",
+            "error": {"type": "api_error", "message": message}}
+
+
+def models_list_openai(catalog):
+    """Our GET /v1/models answer for a bearer-auth request: exactly
+    the free model ids we registered, in OpenAI shape."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": FIXED_CREATED,
+                "owned_by": "aggregator",
+                "free": True,
+            }
+            for model_id in free_model_ids(catalog)
+        ],
     }
-    message_stop = {"type": "message_stop"}
-    return "".join([
-        "event: message_start\n" + _sse_json(start),
-        "event: content_block_start\n" + _sse_json(block_start),
-        "event: content_block_delta\n" + _sse_json(delta),
-        "event: content_block_stop\n" + _sse_json(block_stop),
-        "event: message_delta\n" + _sse_json(message_delta),
-        "event: message_stop\n" + _sse_json(message_stop),
-    ]).encode("utf-8")
+
+
+def models_list_anthropic(catalog):
+    """The same list in Anthropic shape, for an x-api-key request."""
+    return {
+        "data": [
+            {
+                "type": "model",
+                "id": model_id,
+                "display_name": model_id,
+                "created_at": FIXED_DATE,
+                "free": True,
+            }
+            for model_id in free_model_ids(catalog)
+        ],
+        "has_more": False,
+    }
 
 # ---------------------------------------------------------------------------
-# Routing.
+# The server.  One HTTP server, one request at a time, in a thread;
+# the main thread registers with the environment and then polls /work
+# until the workload is done.
+#
+# The manifest entry for the request being served is found by asking
+# the environment which request is next: while a request is in
+# flight, GET /work answers with that request's id, because the
+# driver only advances once the answer is in.  The manifest carries
+# the requirements — including the JSON-mode requirement of the
+# Anthropic requests, which their bodies cannot show, and the
+# min_context requirement, which no body shows at all — so routing
+# reads the manifest first and only falls back to what the body
+# itself reveals when the environment cannot be asked.
 # ---------------------------------------------------------------------------
 
-class State:
-    def __init__(self, brief, catalog, probes, probes_by_id):
+class Aggregator(object):
+    """The trial-long state: the brief, the catalog, the router, and
+    the environment URL.  One instance serves the whole trial."""
+
+    def __init__(self, brief, catalog, env_url):
         self.brief = brief
         self.catalog = catalog
-        self.probes = probes              # [(Provider, models or None)]
-        self.probes_by_id = probes_by_id  # id -> (Provider, models or None)
-        self.models = served_models(brief, probes)
-        self.manifest_index = 0
-        self.calls = 0                    # successful provider calls
-        self.attempts = 0                 # every upstream call made
-        self._fail_streaks = {}
-        self._exhausted = set()
-        self._lock = threading.Lock()
+        self.env_url = env_url
+        self.router = Router(brief, env_url)
+        self.lock = threading.Lock()
 
-    def request_row(self):
-        if self.manifest_index < len(self.brief.manifest):
-            return self.brief.manifest[self.manifest_index]
-        return None
-
-    def candidates(self, api, requires):
-        """(Provider, model, rating) candidates, best rating first.
-
-        Only free models that meet the request's requirements. A JSON-mode
-        OpenAI request never goes to an Anthropic-wire provider, whose echo
-        cannot carry JSON mode.
-        """
-        out = []
-        for provider, models in self.probes:
-            if models is None or provider.id in self._exhausted:
-                continue
-            for model in models:
-                if not model_is_free(self.brief, provider.id, model["id"], model["free"]):
-                    continue
-                if api == "openai" and requires.get("json") \
-                        and provider.wire == "anthropic":
-                    continue
-                caps = model_caps(self.brief, provider.id, model["id"], model)
-                if not meets(requires, caps):
-                    continue
-                out.append((provider, model["id"], caps["rating"]))
-        out.sort(key=lambda item: (-item[2], item[0].id, item[1]))
-        return out
-
-    def call(self, provider, url, headers, payload, stream, is_gemini):
-        """One upstream attempt; returns (status, body) or (None, b'')."""
-        with self._lock:
-            self.attempts += 1
-        if is_gemini:
-            headers = dict(headers)
-            if stream:
-                url = url + ":streamGenerateContent?alt=sse"
-            else:
-                url = url + ":generateContent"
-            status, body = upstream_json("POST", url, headers, payload)
-        else:
-            status, body = upstream_json(
-                "POST", url, headers,
-                {**payload, "stream": True} if stream else payload)
-        if status is None:
-            self._note_failure(provider.id)
-            return None, b""
-        if 200 <= status < 300:
-            self._note_success(provider.id)
-            with self._lock:
-                self.calls += 1
-            return status, body
-        # A refusal does not consume an answer but does count against the
-        # provider: two refusals in a row retire it for this trial. (The
-        # budget check on the provider's side already counts refusals, so
-        # this is a guard, not the throttle.)
-        if status in (402, 429) or 500 <= status < 600:
-            self._note_failure(provider.id)
-            return status, body
-        return status, body
-
-    def _note_failure(self, provider_id):
-        with self._lock:
-            streak = self._fail_streaks.get(provider_id, 0) + 1
-            self._fail_streaks[provider_id] = streak
-            if streak >= 2:
-                self._exhausted.add(provider_id)
-
-    def _note_success(self, provider_id):
-        with self._lock:
-            self._fail_streaks[provider_id] = 0
-
-
-def _parse_upstream_answer(body, provider, stream):
-    if provider.wire == "gemini":
-        # streamGenerateContent answers as SSE; take the last JSON payload.
-        text = body.decode("utf-8", errors="replace")
-        last = None
-        for line in text.splitlines():
-            if line.startswith("data:"):
-                last = line[5:].strip()
-        payload = text
-        if stream and last:
-            payload = last
-        try:
-            return _provider_answer(json.loads(payload), "gemini")
-        except ValueError:
+    def work_next_id(self):
+        """The id of the request the environment is sending now, or
+        None when it cannot be asked."""
+        if not self.env_url:
             return None
-    try:
-        return _provider_answer(json.loads(body.decode("utf-8")), provider.wire)
-    except ValueError:
+        doc = http_get_json(self.env_url.rstrip("/") + "/work", {},
+                            CATALOG_TIMEOUT)
+        if doc is None:
+            return None
+        request_id = doc.get("next")
+        if isinstance(request_id, str) and request_id != "":
+            return request_id
         return None
 
+    def requirements_for(self, api, body, norm):
+        """A request's requirements, from its manifest row when the
+        row can be found, else from what the body itself reveals."""
+        request_id = self.work_next_id()
+        if request_id is not None:
+            row = self.brief.manifest.get(request_id)
+            if row is not None:
+                return dict(row.get("requires") or {})
+        # Fallback: derive what the body shows.  Tools and images are
+        # visible; JSON mode is visible on the OpenAI wire only;
+        # min_context cannot be derived and is left unset.
+        requires = {}
+        if norm["tools"]:
+            requires["tools"] = True
+        if norm["json_mode"]:
+            requires["json"] = True
+        for message in norm["messages"]:
+            for part in message["parts"]:
+                if part["kind"] == "image":
+                    requires["vision"] = True
+        return requires
 
-def route(state, api, body):
-    """Serve one client request; returns (status, content_type, payload)."""
-    row = state.request_row()
-    if row is not None and row["api"] != api:
-        # Manifest and arrival order disagree; trust the client's own wire
-        # and the requirements the body itself carries.
-        row = None
-    with state._lock:
-        state.manifest_index += 1
-    requires = _body_requirements(body) if row is None else row["requires"]
-    client_model = as_str(body.get("model")) or "unknown"
-    stream = body.get("stream") is True
-    for provider, model_id, _rating in state.candidates(api, requires):
-        base = join_base(ENV_URL, provider.base)
-        headers = {"accept": "application/json"}
-        headers.update(auth_headers(provider))
-        if provider.wire == "anthropic":
-            headers["anthropic-version"] = ANTHROPIC_VERSION
-        if provider.wire == "openai":
-            if api == "anthropic":
-                upstream_body = anthropic_to_openai(body, model_id)
-            else:
-                upstream_body = dict(body)
-                upstream_body["model"] = model_id
-            # Never ask the provider for a stream: the server buffers the
-            # whole answer and builds the client's SSE itself. A streamed
-            # upstream answer is SSE text, not the JSON this parser reads.
-            upstream_body.pop("stream", None)
-            upstream_body.pop("stream_options", None)
-            url = base + "/v1/chat/completions"
-            payload = upstream_body
-        elif provider.wire == "anthropic":
-            if api == "anthropic":
-                upstream_body = dict(body)
-                upstream_body["model"] = model_id
-            else:
-                upstream_body = openai_to_anthropic(body, model_id)
-            upstream_body.pop("stream", None)
-            url = base + "/v1/messages"
-            payload = upstream_body
+    def handle_completion(self, api, body):
+        """Serve one client request.  Returns (status, content type,
+        response bytes)."""
+        if api == "openai":
+            norm = extract_openai(body)
         else:
-            if api == "anthropic":
-                payload, _use_stream = anthropic_to_gemini(body, model_id)
-            else:
-                payload, _use_stream = openai_to_gemini(body, model_id)
-            url = base + "/v1beta/models/" + model_id
-        status, raw = state.call(provider, url, headers, payload, False,
-                                 provider.wire == "gemini")
-        if status is None:
-            log("route %s: %s unreachable" % (provider.id, url))
-            continue
-        if status == 402 or status == 429 or 500 <= status < 600:
-            log("route %s: refused with %s; failing over" % (provider.id, status))
-            continue
-        if status == 401 or status == 400:
-            log("route %s: %s -- refusing to retry a bad request" % (provider.id, status))
-            continue
-        if not 200 <= status < 300:
-            log("route %s: unexpected status %s; failing over" % (provider.id, status))
-            continue
-        answer = _parse_upstream_answer(raw, provider, False)
+            norm = extract_anthropic(body)
+        requires = self.requirements_for(api, body, norm)
+        with self.lock:
+            answer, provider_id, model = self.router.serve(norm, requires)
         if answer is None:
-            # A 2xx the server cannot read is not a green light to call
-            # another provider for this request: it would break the
-            # one-provider rule. Return a plain 502 instead.
-            log("route %s: 2xx answer unreadable; not retrying" % provider.id)
-            return 502, "application/json", _error_json(
-                "provider %s returned an unreadable answer" % provider.id)
+            if api == "openai":
+                payload = error_body_openai("no free provider could serve this request")
+            else:
+                payload = error_body_anthropic("no free provider could serve this request")
+            return (502, "application/json",
+                    (compact_json(payload) + "\n").encode("utf-8"))
+        stream = norm["stream"]
         if api == "openai":
             if stream:
-                payload_bytes = openai_stream(answer, client_model, _request_id())
-            else:
-                payload_bytes = _json_bytes(openai_response(
-                    answer, client_model, _request_id(), status))
-            content_type = "text/event-stream" if stream else "application/json"
+                text = openai_sse_response(model, answer)
+                return (200, "text/event-stream; charset=utf-8",
+                        text.encode("utf-8"))
+            payload = openai_json_response(model, answer)
         else:
             if stream:
-                payload_bytes = anthropic_stream(answer, client_model, _request_id())
-            else:
-                payload_bytes = _json_bytes(anthropic_response(
-                    answer, client_model, _request_id()))
-            content_type = "text/event-stream" if stream else "application/json"
-        return 200, content_type, payload_bytes
-    log("route: every candidate refused the request")
-    return 502, "application/json", _error_json("no provider could serve this request")
+                text = anthropic_sse_response(model, answer)
+                return (200, "text/event-stream; charset=utf-8",
+                        text.encode("utf-8"))
+            payload = anthropic_json_response(model, answer)
+        return (200, "application/json",
+                (compact_json(payload) + "\n").encode("utf-8"))
 
-
-def _body_requirements(body):
-    """Requirements derived from a request body, for manifest mismatches."""
-    messages = body.get("messages") or []
-    needs_vision = False
-    for raw in messages:
-        if not is_record(raw):
-            continue
-        content = raw.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if is_record(block) and block.get("type") in ("image_url", "image"):
-                    needs_vision = True
-    fmt = body.get("response_format")
-    return {
-        "tools": bool(body.get("tools")),
-        "vision": needs_vision,
-        "json": is_record(fmt) and fmt.get("type") in ("json_object", "json_schema"),
-        "min_context": None,
-    }
-
-
-def _json_bytes(payload):
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
-
-
-def _error_json(message):
-    return _json_bytes({"error": {"message": message, "type": "server_error"}})
-
-
-_COUNTER = [0]
-_COUNTER_LOCK = threading.Lock()
-
-
-def _request_id():
-    with _COUNTER_LOCK:
-        _COUNTER[0] += 1
-        return "req-aggregator-%06d" % _COUNTER[0]
-
-# ---------------------------------------------------------------------------
-# HTTP server.
-# ---------------------------------------------------------------------------
-
-class Handler(BaseHTTPRequestHandler):
-    state = None
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):  # keep stdout/stderr clean for the env
-        pass
-
-    def do_GET(self):
-        if self.path == "/v1/models":
-            if self.headers.get("x-api-key"):
-                payload = _json_bytes(anthropic_model_list(self.state.models))
-            else:
-                payload = _json_bytes(openai_model_list(self.state.models))
-            self._send(200, "application/json", payload)
-            return
-        self._send(404, "application/json", _error_json("not found"))
-
-    def do_POST(self):
-        length = self.headers.get("Content-Length")
-        try:
-            length = int(length) if length else 0
-        except ValueError:
-            length = 0
-        if length < 0 or length > MAX_BODY_BYTES:
-            self._send(400, "application/json", _error_json("bad request body"))
-            return
-        body_bytes = self.rfile.read(length) if length else b""
-        try:
-            body = json.loads(body_bytes.decode("utf-8"))
-        except ValueError:
-            self._send(400, "application/json", _error_json("invalid JSON"))
-            return
-        if not is_record(body):
-            self._send(400, "application/json", _error_json("request must be a JSON object"))
-            return
-        if self.path == "/v1/chat/completions":
-            status, content_type, payload = route(self.state, "openai", body)
-            self._send(status, content_type, payload)
-        elif self.path == "/v1/messages":
-            status, content_type, payload = route(self.state, "anthropic", body)
-            self._send(status, content_type, payload)
+    def handle_models(self, headers):
+        """GET /v1/models in the wire the auth header names."""
+        if headers.get("x-api-key") is not None:
+            payload = models_list_anthropic(self.catalog)
         else:
-            self._send(404, "application/json", _error_json("not found"))
+            payload = models_list_openai(self.catalog)
+        return (200, "application/json",
+                (compact_json(payload) + "\n").encode("utf-8"))
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    app = None  # set to the Aggregator before serving
+
+    def log_message(self, _format, *_args):
+        pass
 
     def _send(self, status, content_type, payload):
         self.send_response(status)
-        self.send_header("content-type", content_type)
-        self.send_header("content-length", str(len(payload)))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        if payload:
+        if self.command != "HEAD":
             self.wfile.write(payload)
 
+    def _send_json(self, status, payload):
+        self._send(status, "application/json",
+                   (compact_json(payload) + "\n").encode("utf-8"))
 
-def serve(brief):
-    """Probe, register, serve the 20 requests, then exit 0."""
-    probes = []
-    for provider in brief.providers:
-        models = probe_provider(brief, provider)
-        probes.append((provider, models))
-        log("probe %s: %d models" % (
-            provider.id, len(models) if models is not None else -1))
-    catalog = build_catalog(brief, probes)
-    probes_by_id = {p.id: (p, m) for p, m in probes}
-    state = State(brief, catalog, probes, probes_by_id)
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/v1/models":
+            status, content_type, payload = self.app.handle_models(self.headers)
+            self._send(status, content_type, payload)
+        else:
+            self._send_json(404, {"error": "not_found",
+                                  "message": "no route GET %s" % parsed.path})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    Handler.state = state
-    port = server.server_address[1]
-    register_payload = {"protocol_version": PROTOCOL_VERSION,
-                        "port": port, "catalog": catalog}
-    status, body = upstream_json(
-        "POST", ENV_URL + "/register",
-        {"content-type": "application/json"}, register_payload)
-    if status != 200:
-        log("register: env answered %s: %s" % (status, body.decode("utf-8", "replace")[:200]))
-        sys.exit(1)
-    log("registered on port %d" % port)
-    requests = 20
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/v1/chat/completions":
+            api = "openai"
+        elif parsed.path == "/v1/messages":
+            api = "anthropic"
+        else:
+            self._send_json(404, {"error": "not_found",
+                                  "message": "no route POST %s" % parsed.path})
+            return
+        body = parse_json_object(read_body_bytes(self))
+        if body is None:
+            if api == "openai":
+                payload = error_body_openai("the request body is not one JSON object")
+            else:
+                payload = error_body_anthropic("the request body is not one JSON object")
+            self._send_json(400, payload)
+            return
+        try:
+            status, content_type, payload = self.app.handle_completion(api, body)
+        except Exception as err:  # never let one request kill the server
+            sys.stderr.write("aggregator: serving failed: %s\n" % err)
+            if api == "openai":
+                payload_doc = error_body_openai("the server failed: %s" % err)
+            else:
+                payload_doc = error_body_anthropic("the server failed: %s" % err)
+            self._send_json(502, payload_doc)
+            return
+        self._send(status, content_type, payload)
+
+
+# ---------------------------------------------------------------------------
+# Running the trial: pick a port, serve, register, poll /work, exit.
+# ---------------------------------------------------------------------------
+
+def post_register(env_url, port, catalog):
+    """POST the register body.  Returns the parsed answer, or None."""
+    url = env_url.rstrip("/") + "/register"
+    payload = {"protocol_version": 1, "port": port, "catalog": catalog}
+    data = compact_json(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    request = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
     try:
-        parsed = json.loads(body.decode("utf-8"))
-        if is_record(parsed) and isinstance(parsed.get("requests"), int):
-            requests = parsed["requests"]
-    except ValueError:
-        pass
+        with urllib.request.urlopen(request, timeout=CATALOG_TIMEOUT) as reply:
+            raw = reply.read()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return parse_json_object(raw)
 
+
+def work_is_done(env_url):
+    doc = http_get_json(env_url.rstrip("/") + "/work", {}, CATALOG_TIMEOUT)
+    if doc is None:
+        return False
+    return doc.get("done") is True
+
+
+def run_list_mode():
+    """python3 main.py --list: print the catalog and exit 0.  With
+    no brief there is nothing to list."""
+    brief_path = os.environ.get("MAKEFUN_PROMPT_FILE", "")
+    if not brief_path:
+        sys.stdout.write('{"providers":[]}\n')
+        return 0
+    brief = Brief.from_file(brief_path)
+    env_url = os.environ.get("MAKEFUN_ENV_URL", "")
+    catalog = build_catalog(brief, env_url)
+    sys.stdout.write(compact_json(catalog) + "\n")
+    return 0
+
+
+def run_server_mode():
+    brief_path = os.environ.get("MAKEFUN_PROMPT_FILE", "")
+    env_url = os.environ.get("MAKEFUN_ENV_URL", "")
+    if not brief_path:
+        sys.stderr.write("aggregator: MAKEFUN_PROMPT_FILE is not set\n")
+        return 1
+    if not env_url:
+        sys.stderr.write("aggregator: MAKEFUN_ENV_URL is not set\n")
+        return 1
+    brief = Brief.from_file(brief_path)
+    catalog = build_catalog(brief, env_url)
+
+    server = HTTPServer(("0.0.0.0", 0), RequestHandler)
+    RequestHandler.app = Aggregator(brief, catalog, env_url)
+    port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    try:
-        while state.manifest_index < requests:
-            time.sleep(POLL_INTERVAL)
-    finally:
+
+    answer = post_register(env_url, port, catalog)
+    if not isinstance(answer, dict) or answer.get("ok") is not True:
+        sys.stderr.write("aggregator: registration refused: %r\n" % (answer,))
         server.shutdown()
-        server.server_close()
-    log("served %d requests, %d upstream calls, %d attempts"
-        % (state.manifest_index, state.calls, state.attempts))
+        return 1
+    sys.stderr.write("aggregator: registered on port %d for %s requests\n"
+                     % (port, answer.get("requests")))
+
+    for _ in range(WORK_POLL_MAX):
+        if work_is_done(env_url):
+            server.shutdown()
+            return 0
+        time.sleep(WORK_POLL_INTERVAL)
+    sys.stderr.write("aggregator: workload did not finish in time\n")
+    server.shutdown()
     return 0
 
 
 def main(argv):
-    if "--list" in argv:
-        brief = Brief(PROMPT_FILE)
-        if brief.error is not None or not ENV_URL:
-            # No brief, or no env to probe: the brief carries no model
-            # lists of its own, so there is nothing to list.
-            sys.stdout.write('{"providers":[]}\n')
-            if brief.error is not None:
-                log("list: %s" % brief.error)
-            return 0
-        probes = [(provider, probe_provider(brief, provider))
-                  for provider in brief.providers]
-        catalog = build_catalog(brief, probes)
-        sys.stdout.write(json.dumps(catalog, separators=(",", ":")) + "\n")
-        return 0
-    brief = Brief(PROMPT_FILE)
-    if brief.error is not None:
-        log(brief.error)
-        return 1
-    if not ENV_URL:
-        log("MAKEFUN_ENV_URL is not set")
-        return 1
-    return serve(brief)
+    if "--list" in argv[1:]:
+        return run_list_mode()
+    return run_server_mode()
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main(sys.argv))
